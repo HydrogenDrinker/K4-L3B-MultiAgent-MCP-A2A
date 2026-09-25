@@ -1,0 +1,158 @@
+Mục tiêu:
+
+Thiết lập kiến trúc phối hợp đa tác tử (A2A), phân định trách nhiệm từng Agent và khóa cứng Schema chuẩn trong contracts/schemas/.
+Kiến trúc kỳ vọng:
+
+                          ┌──────────────────────────┐
+                          │   Coordinator / Router   │
+                          └─────────────┬────────────┘
+                                        │ (Handoff)
+         ┌──────────────────────────────┼──────────────────────────────┐
+         ▼                              ▼                              ▼
+┌──────────────────┐           ┌──────────────────┐           ┌──────────────────┐
+│ Order/Item Agent │           │  Payment Agent   │           │  Shipment Agent  │
+└────────┬─────────┘           └────────┬─────────┘           └────────┬─────────┘
+         │                              │                              │
+         └──────────────────────────────┼──────────────────────────────┘
+                                        │ (MCP Evidence Collector)
+                                        ▼
+                               ┌──────────────────┐
+                               │   Policy Agent   │
+                               └────────┬─────────┘
+                                        │
+                                        ▼
+                               ┌──────────────────┐
+                               │  Verifier Agent  │
+                               └────────┬─────────┘
+                                        │ (Validated Output)
+                                        ▼
+                                   [END OUTPUT]
+
+Chép
+Các nhiệm vụ trọng tâm:
+
+    1. Khóa Public Contracts (contracts/schemas/):
+
+    l3a-output-v2.schema.json (hoặc l3b): Schema bắt buộc cho output từng case.
+    trace-event-v1.schema.json: Schema cho trace log observable.
+    submission-manifest-v2.schema.json: Schema cho manifest khi đóng gói nộp bài.
+    mcp-evidence-response-v1.schema.json: Cấu trúc phong bì (envelope) trả về từ MCP Gateway.
+
+Nguyên tắc: Không thêm bất kỳ field nào ngoài schema. Nếu có sai lệch, JSON Schema luôn là chân lý ưu tiên tối cao, tuyệt đối tuân thủ chỗ này nhé các bạn, ràng buộc đau đớn mà liêm
+
+    1. Linh hoạt framework các bạn là kỹ sư thiết kế thực chiến nên là thoải mái sáng tạo:
+
+    Điểm triển khai chính nằm tại: src/student_agent/workflow.py:
+
+async def solve_case(case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter) -> dict[str, Any]:
+    # Triển khai coordinator và specialist agents tại đây
+    ...
+
+Chép
+
+    Cuộc thi không chấm điểm dựa trên tên framework (học viên có thể dùng LangGraph, Semantic Kernel, CrewAI hoặc thuần Python async state-machine). Hệ thống chỉ đánh giá kết quả nghiệp vụ, tính hợp lệ của bằng chứng MCP và trace log.
+
+    1. Hoàn thiện mô tả kiến trúc trong ARCHITECTURE.md:
+
+    Phác thảo luồng handoff, tool permissions của từng agent, cơ chế retry khi MCP gặp sự cố.
+
+Từng agent chuyên trách truy vấn bằng chứng có thẩm quyền qua MCP Evidence Gateway theo đúng scope của từng case và ghi nhận trace audit.
+Nguyên tắc của MCP Gateway:
+#	Nguyên tắc	Nếu vi phạm
+1	Truyền đúng case_id cho mọi MCP call	Bị từ chối truy cập (403 Forbidden)
+2	KHÔNG tự sinh hoặc sửa đổi evidence_ref	Hard Gate 0 điểm toàn bài
+3	Chỉ trích dẫn evidence thực sự hỗ trợ kết luận	Bị trừ điểm thành phần Evidence Relevance
+4	Ghi nhận event tool_result_consumed trong trace	Không được công nhận tính xác thực
+5	Server lưu Audit độc lập (Hash, Latency, Status)	Bị phát hiện nếu giả mạo trace client
+
+Đọc kĩ chỗ này để tránh được các lỗi nhé mọi người.
+Triển khai cụ thể:
+
+    1. Gọi Tool qua Gateway:
+
+# Lấy dữ liệu đơn hàng có thẩm quyền từ MCP
+evidence = await gateway.call(
+    "get_order",
+    case_id=case["case_id"],
+    order_id=order_id,
+)
+evidence_ref = evidence["evidence_ref"]
+order_data = evidence["data"]
+
+Chép
+
+    1. Ghi nhận Trace Event hợp lệ:
+
+# Ghi nhận sự kiện tiêu thụ bằng chứng vào trace audit
+trace.emit(
+    case_id=case["case_id"],
+    event_type="tool_result_consumed",
+    actor="order-agent",
+    tool_name="get_order",
+    evidence_refs=[evidence_ref],
+)
+
+Áp dụng chính sách trọng tài tranh chấp, kiểm chứng chéo mâu thuẫn dữ liệu và hiệu chuẩn độ tin cậy.
+Triển khai:
+
+    1. Policy Agent:
+
+    Ra quyết định dựa trên chính sách contracts/scoring/scoring-policy-v2.json:
+    Primary Issue: Xác định lỗi cốt lõi (canceled_order_paid, late_delivery_seller, late_delivery_logistics, payment_mismatch,...).
+    Responsible Party: Phân định trách nhiệm rõ ràng (seller, platform, logistics_provider, payment_provider, customer).
+    Financial Resolution: Số tiền hoàn chính xác (recommended_refund_brl, refund_lines).
+    Resolution Actions: Các hành động cụ thể cần thực hiện.
+
+    1. Verifier Agent & Confidence Calibration:
+
+    Cross-field Consistency: Đảm bảo primary_issue, responsible_parties và financial_resolution hoàn toàn logic và nhất quán (ví dụ: lỗi do người bán thì đơn vị vận chuyển không thể chịu trách nhiệm hoàn tiền).
+    Confidence Calibration: Đánh giá điểm tin cậy confidence [0.0 - 1.0] dựa trên chất lượng và độ đầy đủ của evidence (không tự tin thái quá 1.0 nếu bằng chứng có mâu thuẫn).
+    Lifecycle Events: Đảm bảo traces/trace.jsonl ghi nhận đủ các event bắt buộc:
+    case_received -> task_assigned -> tool_result_consumed -> handoff -> policy_decided -> verification_completed -> case_finalized.
+    Tệp submission.zip Bắt buộc chỉ chứa 3 thành phần tại thư mục gốc của ZIP (tuyệt đối không có thư mục bọc ngoài nha mọi người, hệ thống unzip ra chấm 0đ vì không đọc được vào trong):
+
+submission.zip
+├── manifest.json
+├── trace.jsonl
+└── outputs/
+    ├── L3A_CASE_001.json
+    ├── L3A_CASE_002.json
+    └── ... (đủ đúng 100 files output)
+
+Chép
+Chi tiết 3 thành phần bắt buộc:
+
+    1. manifest.json: Khai báo metadata đợt thi theo chuẩn submission-manifest-v2.schema.json:
+
+{
+  "schema_version": "day09-submission-manifest-v2",
+  "competition_id": "day09-multiagent-mcp-a2a",
+  "variant_id": "l3a",
+  "case_set_version": "v2.1",
+  "output_schema_version": "day09-l3a-output-v2",
+  "trace_schema_version": "day09-trace-event-v1",
+  "generated_at": "2026-09-25T08:00:00Z",
+  "client": {
+    "name": "day09-student-starter",
+    "version": "0.1.0"
+  }
+}
+
+Chép
+
+    1. trace.jsonl: Toàn bộ nhật ký audit event đa tác tử, đặt ngay tại root của ZIP.
+    2. outputs/: Thư mục chứa đúng 100 file JSON kết quả cho từng case.
+
+Lưu ý: - Không đưa mã nguồn src/, file .env, Team API Key, raw inputs hay debug logs vào ZIP.
+2. Lệnh đóng gói tự động chuẩn hóa
+
+Để tránh sai sót thủ công, sử dụng lệnh đóng gói tích hợp sẵn trong CLI day09:
+
+day09 package --output dist/submission.zip
+
+Chép
+Pass Signal Pha 6: Console in ra: OK: .../dist/submission.zip Lệnh này đã tự động chạy bộ kiểm tra toàn diện: validate 100 outputs, validate trace events, build manifest V2, kiểm tra dung lượng và quét regex phát hiện leak API Key trước khi xuất file zip.
+3. Nộp bài lên Competition Workspace
+
+    1. Vào trang nộp bài và upload file zip đó lên
+    2. Hệ thống queue vào và auto scoring, đợi kết quả
